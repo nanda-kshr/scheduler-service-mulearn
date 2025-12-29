@@ -17,6 +17,7 @@ export class SchedulerController {
     return this.svc.findAll();
   }
 
+  
   @Delete(':id')
   @HttpCode(204)
   async remove(@Param('id') id: string) {

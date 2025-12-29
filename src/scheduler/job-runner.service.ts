@@ -17,6 +17,14 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
   private running = 0;
   private queue: (() => void)[] = [];
 
+  // track metadata about scheduled cron tasks so we can detect updates
+  private cronMeta = new Map<string, { cron: string; timezone?: string }>();
+
+  // periodic DB sync interval
+  private syncInterval?: NodeJS.Timeout;
+  private readonly SYNC_MS = parseInt(process.env.JOB_SYNC_INTERVAL_MS ?? '300000', 10); // 5 minutes by default
+
+
   constructor(
     @InjectRepository(JobEntity)
     private readonly repo: Repository<JobEntity>,
@@ -33,10 +41,17 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
         await this.scheduleRecurring(job);
       }
     }
+
+    // start periodic DB sync to pick up changes (additions, updates, deletions)
+    this.syncWithDb().catch((err) => this.logger.error('Initial sync failed', err as any));
+    this.syncInterval = setInterval(() => {
+      this.syncWithDb().catch((err) => this.logger.error('Periodic sync failed', err as any));
+    }, this.SYNC_MS);
   }
 
   onModuleDestroy() {
     this.logger.log('Stopping JobRunner, clearing timers');
+    if (this.syncInterval) clearInterval(this.syncInterval);
     this.timers.forEach((t) => clearTimeout(t));
     this.cronJobs.forEach((c) => c.stop());
   }
@@ -45,6 +60,12 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
     try {
       if (!job.scheduling?.execute_at) {
         this.logger.warn(`Oneoff job ${job.id} missing execute_at`);
+        return;
+      }
+
+      // If we already have a timer for this job, skip scheduling
+      if (this.timers.has(job.id)) {
+        this.logger.log(`Oneoff ${job.id} already scheduled`);
         return;
       }
 
@@ -95,11 +116,17 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
       const timezone = job.scheduling?.timezone;
       const options = timezone ? { timezone } : undefined;
 
+      // If we already have a cron for this id, remove it first (handles updates)
+      if (this.cronJobs.has(job.id)) {
+        await this.unscheduleJob(job.id);
+      }
+
       const task = cron.schedule(cronExpr, () => {
         this.enqueue(() => this.execute(job.id));
       }, options as any);
 
       this.cronJobs.set(job.id, task);
+      this.cronMeta.set(job.id, { cron: cronExpr, timezone: timezone });
       this.logger.log(`Scheduled recurring ${job.id} cron=${cronExpr} tz=${timezone}`);
     } catch (err) {
       this.logger.error('Error scheduling recurring', err as any);
@@ -170,9 +197,21 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
     if (success) {
       // success handling
       job.last_error = null;
-      job.status = job.type === 'oneoff' ? 'completed' : 'scheduled';
-      job.attempt_count = 0; // reset attempts for recurring
-      await this.repo.save(job);
+
+      if (job.type === 'oneoff') {
+        // mark one-off jobs as completed
+        job.status = 'completed';
+        await this.repo.save(job);
+        
+        // ensure any timers/cron are cleaned up
+        await this.unscheduleJob(job.id);
+      } else {
+        job.status = 'scheduled';
+        job.attempt_count = 0; // reset attempts for recurring
+        await this.repo.save(job);
+      }
+      
+
       this.logger.log(`Job ${job.id} succeeded with status=${responseStatus}`);
       return;
     }
@@ -218,6 +257,45 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
     return this.scheduleRecurring(job);
   }
 
+  // sync DB and ensure runner state reflects DB state
+  async syncWithDb() {
+    this.logger.log('Syncing jobs from DB');
+    const jobs = await this.repo.find();
+    const dbIds = new Set(jobs.map((j) => j.id));
+
+    // unschedule recurrences that were removed from DB
+    for (const id of Array.from(this.cronJobs.keys())) {
+      if (!dbIds.has(id)) {
+        this.logger.log(`Recurring job ${id} missing in DB — unscheduling`);
+        await this.unscheduleJob(id);
+      }
+    }
+
+    // schedule new/changed jobs
+    for (const job of jobs) {
+      if (job.type === 'recurring') {
+        const cronExpr = job.scheduling?.cron;
+        const tz = job.scheduling?.timezone;
+        if (!cronExpr) continue;
+
+        const meta = this.cronMeta.get(job.id);
+        if (!this.cronJobs.has(job.id)) {
+          await this.scheduleRecurring(job);
+        } else if (!meta || meta.cron !== cronExpr || meta.timezone !== tz) {
+          // updated cron expression or tz
+          await this.unscheduleJob(job.id);
+          await this.scheduleRecurring(job);
+          this.logger.log(`Rescheduled recurring ${job.id} due to change`);
+        }
+      } else if (job.type === 'oneoff') {
+        // schedule one-off jobs that aren't already scheduled
+        if (job.status === 'scheduled' && !this.timers.has(job.id)) {
+          await this.scheduleOneOff(job);
+        }
+      }
+    }
+  }
+
   // allow external callers to unschedule a job (clear timers / cron tasks)
   async unscheduleJob(id: string) {
     // clear main timer
@@ -245,6 +323,7 @@ export class JobRunnerService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`Error stopping cron for ${id}: ${String(err)}`);
       }
       this.cronJobs.delete(id);
+      this.cronMeta.delete(id);
     }
     this.logger.log(`Unscheduled job ${id}`);
   }
