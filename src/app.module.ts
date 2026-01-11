@@ -4,6 +4,8 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { SchedulerModule } from './scheduler/scheduler.module';
+import { APP_GUARD } from '@nestjs/core';
+import { ApiKeyGuard } from './guards/api-key.guard';
 
 @Module({
   imports: [
@@ -12,35 +14,35 @@ import { SchedulerModule } from './scheduler/scheduler.module';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
-        const dbType = config.get<string>('DB_TYPE', 'sqlite');
+        const dbType = config.get<string>('DB_TYPE');
         const entities = [__dirname + '/**/*.entity{.ts,.js}'];
 
-        if (dbType === 'mysql') {
-          return {
-            type: 'mysql' as const,
-            host: config.get<string>('DATABASE_HOST', 'localhost'),
-            port: parseInt(config.get<string>('DATABASE_PORT', '3306'), 10),
-            username: config.get<string>('DATABASE_USER', 'root'),
-            password: config.get<string>('DATABASE_PASSWORD', ''),
-            database: config.get<string>('DATABASE_NAME', 'scheduler'),
-            entities,
-            synchronize: config.get<string>('DB_SYNC', 'false') === 'true',
-            logging: config.get<string>('DB_LOGGING', 'false') === 'true',
-          };
+        if (dbType !== 'mysql') {
+          throw new Error('Only MySQL database is supported. Please check DB_TYPE in .env');
         }
 
         return {
-          type: 'sqlite' as const,
-          database: config.get<string>('DB_FILE', 'database.sqlite'),
+          type: 'mysql' as const,
+          host: config.get<string>('DATABASE_HOST', 'localhost'),
+          port: parseInt(config.get<string>('DATABASE_PORT', '3306'), 10),
+          username: config.get<string>('DATABASE_USER', 'root'),
+          password: config.get<string>('DATABASE_PASSWORD', ''),
+          database: config.get<string>('DATABASE_NAME', 'scheduler'),
           entities,
-          synchronize: true,
-          logging: false,
+          synchronize: config.get<string>('DB_SYNC', 'false') === 'true',
+          logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         };
       },
     }),
     SchedulerModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: ApiKeyGuard,
+    },
+  ],
 })
-export class AppModule {}
+export class AppModule { }

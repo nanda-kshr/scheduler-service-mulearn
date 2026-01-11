@@ -4,7 +4,7 @@ import { SchedulerService } from './scheduler.service';
 
 @Controller('jobs')
 export class SchedulerController {
-  constructor(private readonly svc: SchedulerService) {}
+  constructor(private readonly svc: SchedulerService) { }
 
   @Post()
   async create(@Body() payload: CreateJobDto) {
@@ -17,7 +17,7 @@ export class SchedulerController {
     return this.svc.findAll();
   }
 
-  
+
   @Delete(':id')
   @HttpCode(204)
   async remove(@Param('id') id: string) {
